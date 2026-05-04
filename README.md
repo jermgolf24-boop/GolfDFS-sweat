@@ -4,14 +4,18 @@ A Streamlit app for live-tournament leverage analysis. Upload a mid-contest Draf
 
 ## What it does
 
-Drop a mid-contest standings CSV (or ZIP) → enter your handle → see:
+Drop a mid-contest standings CSV (or ZIP) → enter your handle → see (across three tabs):
 
-- **Status bar** — distance from your chosen target line (cash / top 1% / win) + status pill
-- **Stat cards** — best lineup, median, lineups inside target, total holes remaining across portfolio
-- **Players to root for** — every meaningful leverage play, sorted by leverage × ceiling. Direction (root for / against) and mechanical "Why" description for each.
-- **Cut players (collapsed)** — leverage no longer matters once they're out
-- **Above-me threats** — entries scoring above your best lineup, with overlap and holes-remaining
-- **Below-me threats** — entries within range that could pass you on a hot finish
+**Tab 1 — Players to root for**: Every meaningful leverage play, sorted by leverage × ceiling. Direction (root for / against) and mechanical "Why" description for each.
+
+**Tab 2 — Threats**: Above-me and below-me entry lists with overlap and holes-remaining.
+
+**Tab 3 — Local leverage** (the sharpest tab): For each player, count appearances in **all** lineups above your best lineup vs lineups closest below. Net lev = your exposure − Above %.
+
+- Positive Net lev = your portfolio overweights this player vs the lineups you need to catch. A hot day from them moves you up, not the field above.
+- Negative Net lev = the lineups ahead of you are heavier on this player than you are. Their hot day pushes those lineups further from reach.
+
+Field ownership averages over all 35K entries. Local leverage measures the lineups that actually affect your relative finish. **Cadillac case study from this app:** Cam Young Net lev was −80.2 (you 17%, lineups above you 97.6%). Min Woo Lee Net lev +16 (you 23%, lineups above you 7%). The two best Cam Young alternatives we missed (Adam Scott at −54.6, Sepp Straka at −24.7) were the structural levers we needed.
 
 ## How cut status is inferred
 
@@ -62,4 +66,3 @@ Same path as the postmortem analyzer:
 - v2: DataGolf in-play integration (paid tier)
 - v3: Live auto-refresh on a configurable cadence
 - v4: Combine with the postmortem analyzer into one multi-page app
-
