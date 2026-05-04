@@ -17,6 +17,46 @@ Drop a mid-contest standings CSV (or ZIP) → enter your handle → see (across 
 
 Field ownership averages over all 35K entries. Local leverage measures the lineups that actually affect your relative finish. **Cadillac case study from this app:** Cam Young Net lev was −80.2 (you 17%, lineups above you 97.6%). Min Woo Lee Net lev +16 (you 23%, lineups above you 7%). The two best Cam Young alternatives we missed (Adam Scott at −54.6, Sepp Straka at −24.7) were the structural levers we needed.
 
+**Tab 4 — Lineup deep-dive**: Per-lineup card analysis for your top N lineups by current score. With DataGolf in-play data enabled (paid API), each card shows:
+
+- Current rank, score, gap to target, holes remaining
+- Per-player breakdown: current FPTS, FPTS rank, status, win/top-5/top-10/top-20 probabilities
+- "Expected remaining" per player: probability-weighted total FPTS minus current FPTS
+- Lineup status badge: ALIVE (realistic ceiling beats target) or LOCKED OUT (mathematically dead)
+
+Locked-out lineups are exactly that — even with everything going right, they can't catch the target. Stop rooting for them and reallocate attention to the ALIVE ones.
+
+## DataGolf in-play setup (Tab 4 only)
+
+The Lineup deep-dive tab uses DataGolf's `/preds/in-play` endpoint to compute realistic ceilings. This requires a paid DataGolf API tier with in-play access.
+
+**To enable on Streamlit Cloud:**
+
+1. Open your app in [share.streamlit.io](https://share.streamlit.io)
+2. Click "Settings" (the gear icon, usually bottom-right of the app management page)
+3. Click "Secrets"
+4. Add this line:
+   ```toml
+   DATAGOLF_API_KEY = "your_api_key_here"
+   ```
+5. Save. Streamlit Cloud auto-restarts the app within 30 seconds.
+6. In the sidebar, check "Use DataGolf in-play data".
+
+**To enable locally:**
+
+Create `.streamlit/secrets.toml` in your project directory:
+```toml
+DATAGOLF_API_KEY = "your_api_key_here"
+```
+
+The key never enters your GitHub repo this way — it's stored in Streamlit's secrets manager.
+
+**When in-play data is unavailable** (no live tournament, network issue, key invalid), the deep-dive cards still render but without ceiling estimates. Status shows "NO CEILING DATA".
+
+## Conservative ceiling math
+
+The realistic ceiling per player is `max(0, expected_total_FPTS − current_FPTS)`. For a player already exceeding their expected total (hot round in progress), this returns 0 even though they could go higher. This is intentionally conservative — DataGolf's probabilities reflect "where they'll finish," not "additional upside from a ceiling round on top of an already-hot round." A locked-out flag should be trusted; an alive flag may be slightly understating ceiling for hot players.
+
 ## How cut status is inferred
 
 DraftKings exports lineup-level holes-remaining in mid-contest standings. A lineup with one cut player has 18 fewer holes remaining than otherwise-identical lineups.
@@ -66,3 +106,4 @@ Same path as the postmortem analyzer:
 - v2: DataGolf in-play integration (paid tier)
 - v3: Live auto-refresh on a configurable cadence
 - v4: Combine with the postmortem analyzer into one multi-page app
+
