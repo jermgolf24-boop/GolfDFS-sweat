@@ -20,7 +20,135 @@ import pandas as pd
 import numpy as np
 from io import BytesIO, StringIO
 import zipfile
+import json
+import re
+from urllib.request import urlopen
+from urllib.error import URLError, HTTPError
 from collections import defaultdict, Counter
+
+
+# =============================================================================
+# DataGolf in-play integration
+# =============================================================================
+# Default expected FPTS by finish tier on a typical PGA classic. These are tunable
+# in the sidebar — tournaments with longer fields or richer finish bonuses score
+# higher; opposite-field events lower. Defaults calibrated to recent classics.
+DEFAULT_TIER_FPTS = {
+    'win': 130,        # Win bonus + dominant scoring round
+    'top_5': 100,      # Strong finish bonus + above-average scoring
+    'top_10': 80,
+    'top_20': 60,
+    'remaining_field': 35,  # Made cut, no top-20 → finish bonus only
+}
+
+NAME_OVERRIDES_DG_TO_DK = {
+    # DG returns "first last" with various accent handling; DK uses preferred display name
+    'matt fitzpatrick': 'Matt Fitzpatrick',
+    'matthew mccarty': 'Matthew McCarty',
+    'nicolas echavarria': 'Nicolas Echavarria',
+}
+
+
+def norm_name(s):
+    """Normalize: lowercase, strip non-alpha. Used for cross-source matching."""
+    return re.sub(r'[^a-z]', '', str(s).lower())
+
+
+@st.cache_data(ttl=300, show_spinner=False)  # 5-minute TTL matches API refresh cadence
+def fetch_datagolf_inplay(api_key, tour='pga'):
+    """Fetch live in-play finish probabilities from DataGolf.
+
+    Returns dict: {normalized_player_name: {'win_pct': X, 'top_5_pct': X,
+                                              'top_10_pct': X, 'top_20_pct': X,
+                                              'display_name': 'Original Name'}}
+
+    Returns None on any failure (no key, network error, no live tournament).
+    """
+    if not api_key:
+        return None
+    url = (
+        f"https://feeds.datagolf.com/preds/in-play"
+        f"?tour={tour}&dead_heat=no&odds_format=percent"
+        f"&file_format=json&key={api_key}"
+    )
+    try:
+        with urlopen(url, timeout=10) as resp:
+            data = json.loads(resp.read().decode('utf-8'))
+    except (URLError, HTTPError, json.JSONDecodeError, TimeoutError):
+        return None
+
+    # The endpoint returns an object; player array is typically under 'data' or 'players'.
+    # Different DG endpoints use different schemas; we handle both.
+    players = data.get('data') or data.get('players') or []
+    if not players:
+        return None
+
+    out = {}
+    for p in players:
+        # Field names per DG docs: player_name, win, top_5, top_10, top_20
+        # Some endpoints return values as percentages already (e.g. 12.5), others as
+        # decimals (0.125). We auto-detect via magnitude.
+        name = p.get('player_name') or p.get('name')
+        if not name:
+            continue
+        win = _coerce_pct(p.get('win'))
+        t5 = _coerce_pct(p.get('top_5'))
+        t10 = _coerce_pct(p.get('top_10'))
+        t20 = _coerce_pct(p.get('top_20'))
+        out[norm_name(name)] = {
+            'display_name': name,
+            'win_pct': win,
+            'top_5_pct': t5,
+            'top_10_pct': t10,
+            'top_20_pct': t20,
+        }
+    return out
+
+
+def _coerce_pct(v):
+    """Convert a DataGolf probability value to percent (0-100). DG sometimes returns
+    decimals (0.125) and sometimes percent values (12.5)."""
+    if v is None or pd.isna(v):
+        return 0.0
+    try:
+        f = float(v)
+    except (ValueError, TypeError):
+        return 0.0
+    return f * 100 if f <= 1.0 else f
+
+
+def expected_remaining_fpts(probs, tier_fpts):
+    """Given a player's in-play probabilities and tier-FPTS assumptions,
+    compute expected total final FPTS via tier decomposition.
+
+    Tiers are nested (top-5 ⊂ top-10 ⊂ top-20), so we decompose into
+    mutually-exclusive bands:
+      - win                       : prob = win
+      - top 5 but not winner      : prob = top_5 - win
+      - top 10 but not top 5      : prob = top_10 - top_5
+      - top 20 but not top 10     : prob = top_20 - top_10
+      - made cut, outside top 20  : prob = 100 - top_20  (assumes player is alive;
+                                              for cut players this returns 0 via probs)
+    """
+    win = probs.get('win_pct', 0) / 100
+    t5 = probs.get('top_5_pct', 0) / 100
+    t10 = probs.get('top_10_pct', 0) / 100
+    t20 = probs.get('top_20_pct', 0) / 100
+
+    p_win = win
+    p_top5_not_win = max(0, t5 - win)
+    p_top10_not_top5 = max(0, t10 - t5)
+    p_top20_not_top10 = max(0, t20 - t10)
+    p_field = max(0, 1.0 - t20)
+
+    expected = (
+        p_win * tier_fpts['win']
+        + p_top5_not_win * tier_fpts['top_5']
+        + p_top10_not_top5 * tier_fpts['top_10']
+        + p_top20_not_top10 * tier_fpts['top_20']
+        + p_field * tier_fpts['remaining_field']
+    )
+    return expected
 
 # =============================================================================
 # Page config
@@ -65,6 +193,35 @@ with st.sidebar:
         "Below me",
         min_value=10, max_value=300, value=100, step=10,
     )
+
+    st.markdown("---")
+    st.markdown("**Lineup deep-dive**")
+    deep_dive_n = st.slider(
+        "Top N lineups to analyze",
+        min_value=1, max_value=10, value=5, step=1,
+        help="Per-lineup ceiling analysis is shown for your top N lineups by current score.",
+    )
+
+    use_datagolf = st.checkbox(
+        "Use DataGolf in-play data",
+        value=False,
+        help="Pulls live finish probabilities from DataGolf for ceiling estimates. Requires API key in Streamlit secrets.",
+    )
+
+    if use_datagolf:
+        with st.expander("Tier FPTS assumptions (advanced)"):
+            st.caption("Expected DK FPTS at each finish tier. Defaults calibrated to a typical PGA classic.")
+            tier_win = st.number_input("Win", value=DEFAULT_TIER_FPTS['win'], step=5)
+            tier_t5 = st.number_input("Top 5 (not win)", value=DEFAULT_TIER_FPTS['top_5'], step=5)
+            tier_t10 = st.number_input("Top 10 (not top 5)", value=DEFAULT_TIER_FPTS['top_10'], step=5)
+            tier_t20 = st.number_input("Top 20 (not top 10)", value=DEFAULT_TIER_FPTS['top_20'], step=5)
+            tier_field = st.number_input("Made cut, outside top 20", value=DEFAULT_TIER_FPTS['remaining_field'], step=5)
+            tier_fpts_user = {
+                'win': tier_win, 'top_5': tier_t5, 'top_10': tier_t10,
+                'top_20': tier_t20, 'remaining_field': tier_field,
+            }
+    else:
+        tier_fpts_user = DEFAULT_TIER_FPTS
 
     st.markdown("---")
     st.markdown("**About**")
@@ -633,7 +790,9 @@ else:
               help="Mid-contest export needed for holes-remaining analysis.")
 
 # ---- Tabbed analysis ----
-tab1, tab2, tab3 = st.tabs(["Players to root for", "Threats", "Local leverage"])
+tab1, tab2, tab3, tab4 = st.tabs([
+    "Players to root for", "Threats", "Local leverage", "Lineup deep-dive"
+])
 
 with tab1:
     player_stats = compute_player_field_stats(my_handle, user_exposures, user_lineups, players_df)
@@ -789,6 +948,168 @@ with tab3:
 
     csv = active[display_cols].to_csv(index=False).encode('utf-8')
     st.download_button("⬇ Download CSV", csv, f"{my_handle}_local_leverage.csv", "text/csv")
+
+with tab4:
+    st.caption(
+        f"Per-lineup ceiling analysis for your top {deep_dive_n} lineups by current score. "
+        "For each, see which players are still alive, their realistic remaining FPTS based "
+        "on DataGolf in-play probabilities, and whether the lineup has a mathematical path "
+        "to your target line."
+    )
+
+    # ---- Try to fetch DataGolf in-play data ----
+    dg_probs = None
+    dg_status_msg = None
+    if use_datagolf:
+        api_key = None
+        try:
+            api_key = st.secrets.get('DATAGOLF_API_KEY')
+        except (FileNotFoundError, KeyError):
+            api_key = None
+
+        if not api_key:
+            dg_status_msg = (
+                "⚠ DataGolf API key not found in Streamlit secrets. "
+                "Add `DATAGOLF_API_KEY = \"your_key\"` to .streamlit/secrets.toml "
+                "(local) or your app's Secrets settings (Streamlit Cloud)."
+            )
+        else:
+            with st.spinner("Fetching DataGolf in-play probabilities..."):
+                dg_probs = fetch_datagolf_inplay(api_key)
+            if dg_probs is None:
+                dg_status_msg = (
+                    "⚠ DataGolf in-play fetch failed. Possible reasons: no live "
+                    "tournament right now, network issue, or invalid API key. "
+                    "Falling back to current FPTS only (no ceiling estimates)."
+                )
+            else:
+                dg_status_msg = f"✓ DataGolf in-play data loaded ({len(dg_probs)} players)."
+
+    if dg_status_msg:
+        st.caption(dg_status_msg)
+
+    # ---- Get top N lineups by current score ----
+    my_lineups = sorted(
+        user_lineups[my_handle], key=lambda l: -l['points']
+    )[:deep_dive_n]
+
+    if not my_lineups:
+        st.info(f"No lineups found for handle '{my_handle}'.")
+    else:
+        # Pre-compute per-player joins for cards
+        fpts_lookup = dict(zip(players_df['Player'], players_df['FPTS']))
+        fpts_rank_lookup = {
+            p: i + 1 for i, p in enumerate(
+                players_df.sort_values('FPTS', ascending=False)['Player'].tolist()
+            )
+        }
+        n_field_players = len(players_df)
+
+        for lineup_idx, lu in enumerate(my_lineups, 1):
+            current_score = lu['points']
+            current_rank = lu['rank']
+            holes_remaining = lu.get('holes_remaining')
+
+            # ---- Per-player breakdown ----
+            player_rows = []
+            sum_remaining_ceiling = 0
+            ceiling_available = dg_probs is not None
+            for p in lu['players']:
+                cur_fpts = fpts_lookup.get(p, 0)
+                rank = fpts_rank_lookup.get(p, n_field_players)
+                p_status = cut_status.get(p, 'unknown')
+                row = {
+                    'Player': p,
+                    'Status': p_status,
+                    'Current FPTS': cur_fpts,
+                    'FPTS rank': rank,
+                }
+                if ceiling_available:
+                    probs = dg_probs.get(norm_name(p))
+                    if probs and p_status != 'cut':
+                        expected_total = expected_remaining_fpts(probs, tier_fpts_user)
+                        remaining = max(0, expected_total - cur_fpts)
+                        row['Expected remaining'] = remaining
+                        row['Win %'] = probs.get('win_pct', 0)
+                        row['Top 5 %'] = probs.get('top_5_pct', 0)
+                        row['Top 10 %'] = probs.get('top_10_pct', 0)
+                        row['Top 20 %'] = probs.get('top_20_pct', 0)
+                        sum_remaining_ceiling += remaining
+                    else:
+                        row['Expected remaining'] = 0.0 if p_status == 'cut' else None
+                        row['Win %'] = None
+                        row['Top 5 %'] = None
+                        row['Top 10 %'] = None
+                        row['Top 20 %'] = None
+                player_rows.append(row)
+
+            realistic_ceiling = current_score + sum_remaining_ceiling if ceiling_available else None
+            gap_to_target = max(0, target_line - current_score)
+            ceiling_gap = realistic_ceiling - target_line if realistic_ceiling is not None else None
+
+            # ---- Card header ----
+            if ceiling_available and ceiling_gap is not None:
+                if ceiling_gap >= 0:
+                    card_status_label = "ALIVE"
+                    card_status_color = "#173404"
+                    card_status_bg = "#C0DD97"
+                else:
+                    card_status_label = "LOCKED OUT"
+                    card_status_color = "#501313"
+                    card_status_bg = "#F7C1C1"
+                ceiling_text = f"Realistic ceiling {realistic_ceiling:.1f}"
+            else:
+                card_status_label = "NO CEILING DATA"
+                card_status_color = "#412402"
+                card_status_bg = "#FAEEDA"
+                ceiling_text = "Enable DataGolf in-play for ceiling analysis"
+
+            st.markdown(
+                f"""
+                <div style="border: 0.5px solid var(--secondary-background-color, #e6e6e6);
+                            border-radius: 8px; padding: 16px; margin: 16px 0 8px 0;">
+                  <div style="display: flex; justify-content: space-between; align-items: baseline;
+                              gap: 12px; flex-wrap: wrap; margin-bottom: 8px;">
+                    <div>
+                      <span style="font-weight: 500; font-size: 16px;">Lineup #{lineup_idx}</span>
+                      <span style="color: #888; margin-left: 12px; font-size: 14px;">
+                        Rank #{current_rank:,} · {current_score:.1f} pts
+                        · {gap_to_target:.1f} from {target_label} line
+                      </span>
+                    </div>
+                    <span style="background: {card_status_bg}; color: {card_status_color};
+                                  padding: 2px 10px; border-radius: 999px; font-size: 12px;
+                                  font-weight: 500;">{card_status_label}</span>
+                  </div>
+                  <div style="font-size: 13px; color: #666;">
+                    {ceiling_text} · {holes_remaining if holes_remaining is not None else '—'} holes remaining
+                  </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+            # ---- Per-player table ----
+            pdf = pd.DataFrame(player_rows)
+            if ceiling_available:
+                fmt_cols = {
+                    'Current FPTS': '{:.1f}',
+                    'Expected remaining': '{:.1f}',
+                    'Win %': '{:.1f}',
+                    'Top 5 %': '{:.1f}',
+                    'Top 10 %': '{:.1f}',
+                    'Top 20 %': '{:.1f}',
+                }
+                styled = (
+                    pdf.style.format(fmt_cols, na_rep='—')
+                    .map(style_status, subset=['Status'])
+                )
+            else:
+                styled = (
+                    pdf.style.format({'Current FPTS': '{:.1f}'})
+                    .map(style_status, subset=['Status'])
+                )
+            st.dataframe(styled, use_container_width=True, hide_index=True)
 
 # ---- Footer ----
 st.markdown("---")
