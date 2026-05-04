@@ -1010,6 +1010,27 @@ with tab4:
             current_rank = lu['rank']
             holes_remaining = lu.get('holes_remaining')
 
+            # ---- Compute per-lineup "above this lineup" exposure ----
+            # For THIS specific lineup, count lineups scoring higher and tally
+            # which players appear in those lineups. Excludes my own handle so
+            # we measure real competitors.
+            above_this_count = Counter()
+            n_above_this = 0
+            for _, ent_row in entries_df.iterrows():
+                ent_full = str(ent_row.get('EntryName', ''))
+                ent_handle = ent_full.split(' (')[0].strip()
+                if ent_handle == my_handle:
+                    continue
+                ent_pts = float(ent_row['Points']) if pd.notna(ent_row['Points']) else 0.0
+                if ent_pts <= current_score:
+                    continue
+                ent_lu = parse_lineup(ent_row.get('Lineup'))
+                if len(ent_lu) != 6:
+                    continue
+                n_above_this += 1
+                for p in ent_lu:
+                    above_this_count[p] += 1
+
             # ---- Per-player breakdown ----
             player_rows = []
             sum_remaining_ceiling = 0
@@ -1018,11 +1039,13 @@ with tab4:
                 cur_fpts = fpts_lookup.get(p, 0)
                 rank = fpts_rank_lookup.get(p, n_field_players)
                 p_status = cut_status.get(p, 'unknown')
+                above_this_pct = (above_this_count[p] / n_above_this * 100) if n_above_this > 0 else 0.0
                 row = {
                     'Player': p,
                     'Status': p_status,
                     'Current FPTS': cur_fpts,
                     'FPTS rank': rank,
+                    'Above LU %': above_this_pct,
                 }
                 if ceiling_available:
                     probs = dg_probs.get(norm_name(p))
@@ -1083,6 +1106,7 @@ with tab4:
                   </div>
                   <div style="font-size: 13px; color: #666;">
                     {ceiling_text} · {holes_remaining if holes_remaining is not None else '—'} holes remaining
+                    · {n_above_this:,} lineups above this one
                   </div>
                 </div>
                 """,
@@ -1091,9 +1115,22 @@ with tab4:
 
             # ---- Per-player table ----
             pdf = pd.DataFrame(player_rows)
+
+            # Heat-map "Above LU %": green if low (this player is leverage for THIS lineup),
+            # red if high (this player is in most lineups above — no separation if they pop).
+            def style_above_lu(v):
+                if pd.isna(v):
+                    return ''
+                if v <= 15:
+                    return 'background-color: #C0DD97; color: #173404;'
+                if v >= 60:
+                    return 'background-color: #F7C1C1; color: #501313;'
+                return ''
+
             if ceiling_available:
                 fmt_cols = {
                     'Current FPTS': '{:.1f}',
+                    'Above LU %': '{:.1f}',
                     'Expected remaining': '{:.1f}',
                     'Win %': '{:.1f}',
                     'Top 5 %': '{:.1f}',
@@ -1103,13 +1140,20 @@ with tab4:
                 styled = (
                     pdf.style.format(fmt_cols, na_rep='—')
                     .map(style_status, subset=['Status'])
+                    .map(style_above_lu, subset=['Above LU %'])
                 )
             else:
                 styled = (
-                    pdf.style.format({'Current FPTS': '{:.1f}'})
+                    pdf.style.format({'Current FPTS': '{:.1f}', 'Above LU %': '{:.1f}'})
                     .map(style_status, subset=['Status'])
+                    .map(style_above_lu, subset=['Above LU %'])
                 )
             st.dataframe(styled, use_container_width=True, hide_index=True)
+            st.caption(
+                f"**Above LU %** = of the {n_above_this:,} lineups currently above this lineup, "
+                f"what % contain this player. **Low** (green) = leverage play for this lineup. "
+                f"**High** (red) = already chalk above; their hot finish moves the lineups ahead alongside you."
+            )
 
 # ---- Footer ----
 st.markdown("---")
