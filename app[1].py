@@ -411,6 +411,81 @@ def compute_threats(entries_df, my_best_lineup, my_best_score, n_above, n_below)
     return above_sorted[:n_above], below_sorted[:n_below]
 
 
+def compute_local_leverage(entries_df, my_best_lineup, my_best_score, my_handle,
+                            my_exposures, n_my_lineups, players_df,
+                            cut_status, n_below=100, exclude_my_handle=True):
+    """For each player, count appearances in lineups above my best vs lineups
+    closest below my best.
+
+    Excludes my own lineups by default (otherwise our own exposures pollute
+    the 'above me' counts on plays we made well).
+
+    Returns DataFrame sorted by net leverage descending.
+    """
+    my_set = my_best_lineup['set']
+
+    above_lineups = []
+    below_lineups = []
+
+    for _, r in entries_df.iterrows():
+        full_name = str(r.get('EntryName', ''))
+        handle = full_name.split(' (')[0].strip()
+        if exclude_my_handle and handle == my_handle:
+            continue
+        lineup = parse_lineup(r.get('Lineup'))
+        if len(lineup) != 6:
+            continue
+        pts = float(r['Points']) if pd.notna(r['Points']) else 0.0
+        if pts > my_best_score:
+            above_lineups.append(set(lineup))
+        elif pts < my_best_score:
+            below_lineups.append((pts, set(lineup)))
+
+    # Cap below at n_below closest to my score
+    below_lineups.sort(key=lambda x: -x[0])
+    below_capped = [s for _, s in below_lineups[:n_below]]
+
+    n_above = len(above_lineups)
+    n_below_actual = len(below_capped)
+
+    # Tally player appearances
+    above_count = Counter()
+    below_count = Counter()
+    for lu in above_lineups:
+        for p in lu:
+            above_count[p] += 1
+    for lu in below_capped:
+        for p in lu:
+            below_count[p] += 1
+
+    field_own = dict(zip(players_df['Player'], players_df['field_own']))
+    fpts = dict(zip(players_df['Player'], players_df['FPTS']))
+    fpts_rank = {p: i + 1 for i, p in enumerate(
+        players_df.sort_values('FPTS', ascending=False)['Player'].tolist()
+    )}
+
+    rows = []
+    for player in players_df['Player']:
+        my_pct = my_exposures.get(player, 0) / n_my_lineups * 100 if n_my_lineups else 0
+        above_pct = above_count[player] / n_above * 100 if n_above else 0
+        below_pct = below_count[player] / n_below_actual * 100 if n_below_actual else 0
+        net_lev = my_pct - above_pct
+        rows.append({
+            'Player': player,
+            'Status': cut_status.get(player, 'unknown'),
+            'My %': my_pct,
+            'Above %': above_pct,
+            'Below %': below_pct,
+            'Net lev': net_lev,
+            'My − Below': my_pct - below_pct,
+            'Field %': field_own.get(player, 0),
+            'FPTS': fpts.get(player, 0),
+            'FPTS rank': fpts_rank.get(player, 999),
+        })
+
+    return pd.DataFrame(rows), n_above, n_below_actual
+
+
 # =============================================================================
 # Display helpers
 # =============================================================================
@@ -557,93 +632,163 @@ else:
     c5.metric("Holes data", "Not in export",
               help="Mid-contest export needed for holes-remaining analysis.")
 
-# ---- Players to root for ----
-st.markdown("## Players to root for")
+# ---- Tabbed analysis ----
+tab1, tab2, tab3 = st.tabs(["Players to root for", "Threats", "Local leverage"])
 
-player_stats = compute_player_field_stats(my_handle, user_exposures, user_lineups, players_df)
-rooting_df = build_rooting_table(player_stats, cut_status, len(players_df))
+with tab1:
+    player_stats = compute_player_field_stats(my_handle, user_exposures, user_lineups, players_df)
+    rooting_df = build_rooting_table(player_stats, cut_status, len(players_df))
 
-# Filter to meaningful leverage only (>= 1pp absolute)
-display_rooting = rooting_df[rooting_df['Lev pp'].abs() >= 1].copy()
-# And drop cut players from primary view
-active_rooting = display_rooting[display_rooting['Status'] != 'cut'].copy()
-cut_rooting = display_rooting[display_rooting['Status'] == 'cut'].copy()
+    display_rooting = rooting_df[rooting_df['Lev pp'].abs() >= 1].copy()
+    active_rooting = display_rooting[display_rooting['Status'] != 'cut'].copy()
+    cut_rooting = display_rooting[display_rooting['Status'] == 'cut'].copy()
 
-st.caption(
-    "Players where your exposure differs meaningfully from the field, ranked by leverage × ceiling factor. "
-    "Direction tells you whether to root for them (you're overweight) or against (field is overweight)."
-)
+    st.caption(
+        "Players where your exposure differs meaningfully from the field, ranked by leverage × ceiling factor. "
+        "Direction tells you whether to root for them (you're overweight) or against (field is overweight)."
+    )
 
-display_cols = ['Player', 'Direction', 'My %', 'Field %', 'Lev pp', 'Status', 'FPTS rank', 'Why']
-styled = (
-    active_rooting[display_cols].style
-    .format({'My %': '{:.1f}', 'Field %': '{:.1f}', 'Lev pp': '{:+.1f}'})
-    .map(style_lev, subset=['Lev pp'])
-    .map(style_direction, subset=['Direction'])
-    .map(style_status, subset=['Status'])
-)
-st.dataframe(styled, use_container_width=True, height=min(500, 60 + 35 * len(active_rooting)))
+    display_cols = ['Player', 'Direction', 'My %', 'Field %', 'Lev pp', 'Status', 'FPTS rank', 'Why']
+    styled = (
+        active_rooting[display_cols].style
+        .format({'My %': '{:.1f}', 'Field %': '{:.1f}', 'Lev pp': '{:+.1f}'})
+        .map(style_lev, subset=['Lev pp'])
+        .map(style_direction, subset=['Direction'])
+        .map(style_status, subset=['Status'])
+    )
+    st.dataframe(styled, use_container_width=True, height=min(500, 60 + 35 * len(active_rooting)))
 
-if len(cut_rooting):
-    with st.expander(f"Cut players ({len(cut_rooting)}) — leverage no longer matters"):
-        st.dataframe(
-            cut_rooting[display_cols].style
-            .format({'My %': '{:.1f}', 'Field %': '{:.1f}', 'Lev pp': '{:+.1f}'}),
-            use_container_width=True,
+    if len(cut_rooting):
+        with st.expander(f"Cut players ({len(cut_rooting)}) — leverage no longer matters"):
+            st.dataframe(
+                cut_rooting[display_cols].style
+                .format({'My %': '{:.1f}', 'Field %': '{:.1f}', 'Lev pp': '{:+.1f}'}),
+                use_container_width=True,
+            )
+
+with tab2:
+    above, below = compute_threats(
+        entries_df, summary['best_lineup'], summary['best_score'],
+        threats_above_n, threats_below_n,
+    )
+
+    col_above, col_below = st.columns(2)
+
+    with col_above:
+        st.markdown(f"### Above me ({len(above)})")
+        st.caption("Entries scoring above your best. Lower overlap with your lineup = harder to catch.")
+        if above:
+            rows = []
+            for r in above:
+                rows.append({
+                    'Rank': r['Rank'],
+                    'Handle': r['Handle'][:18],
+                    'Points': r['Points'],
+                    'Gap': r['Points'] - summary['best_score'],
+                    'Overlap': f"{r['Overlap']}/6",
+                    'Holes left': r['Holes'] if r['Holes'] is not None else '—',
+                })
+            adf = pd.DataFrame(rows)
+            styled_above = adf.style.format({
+                'Points': '{:.1f}', 'Gap': '+{:.1f}',
+            })
+            st.dataframe(styled_above, use_container_width=True, height=400)
+        else:
+            st.success("Nobody is above your best lineup.")
+
+    with col_below:
+        st.markdown(f"### Below me ({len(below)})")
+        st.caption("Entries scoring below your best. Lower overlap + more holes = real threat to pass you.")
+        if below:
+            rows = []
+            for r in below:
+                rows.append({
+                    'Rank': r['Rank'],
+                    'Handle': r['Handle'][:18],
+                    'Points': r['Points'],
+                    'Gap': r['Points'] - summary['best_score'],
+                    'Overlap': f"{r['Overlap']}/6",
+                    'Holes left': r['Holes'] if r['Holes'] is not None else '—',
+                })
+            bdf = pd.DataFrame(rows)
+            styled_below = bdf.style.format({
+                'Points': '{:.1f}', 'Gap': '{:.1f}',
+            })
+            st.dataframe(styled_below, use_container_width=True, height=400)
+        else:
+            st.info("No threats currently below you in range.")
+
+with tab3:
+    n_my = len(user_lineups[my_handle])
+    my_exp = user_exposures[my_handle]
+
+    local_lev_df, n_above_total, n_below_actual = compute_local_leverage(
+        entries_df,
+        summary['best_lineup'],
+        summary['best_score'],
+        my_handle,
+        my_exp,
+        n_my,
+        players_df,
+        cut_status,
+        n_below=100,
+        exclude_my_handle=True,
+    )
+
+    st.caption(
+        f"For each player, count appearances in **all {n_above_total:,} lineups above your best** "
+        f"vs the **{n_below_actual} lineups closest below**. **Net lev** = your exposure − Above %. "
+        "Positive Net lev means a hot day from this player helps you more than it helps the lineups "
+        "you need to catch. Your own lineups are excluded from the counts."
+    )
+
+    if n_above_total == 0:
+        st.success(
+            "Nobody is above your best lineup, so Local leverage doesn't apply right now. "
+            "The 'Below me' counts are still informative for defending your position."
         )
 
-# ---- Threat lists ----
-st.markdown("## Threats")
-above, below = compute_threats(
-    entries_df, summary['best_lineup'], summary['best_score'],
-    threats_above_n, threats_below_n,
-)
+    # Show all players with non-trivial my % or above %
+    relevant = local_lev_df[
+        (local_lev_df['My %'] >= 1) | (local_lev_df['Above %'] >= 5)
+    ].copy()
 
-col_above, col_below = st.columns(2)
+    # Drop cut players from primary view
+    active = relevant[relevant['Status'] != 'cut'].copy()
+    cut = relevant[relevant['Status'] == 'cut'].copy()
 
-with col_above:
-    st.markdown(f"### Above me ({len(above)})")
-    st.caption("Entries scoring above your best. Lower overlap with your lineup = harder to catch.")
-    if above:
-        rows = []
-        for r in above:
-            rows.append({
-                'Rank': r['Rank'],
-                'Handle': r['Handle'][:18],
-                'Points': r['Points'],
-                'Gap': r['Points'] - summary['best_score'],
-                'Overlap': f"{r['Overlap']}/6",
-                'Holes left': r['Holes'] if r['Holes'] is not None else '—',
-            })
-        adf = pd.DataFrame(rows)
-        styled_above = adf.style.format({
-            'Points': '{:.1f}', 'Gap': '+{:.1f}',
+    # Sort by Net lev descending — most-helpful-if-they-pop at top
+    active = active.sort_values('Net lev', ascending=False).reset_index(drop=True)
+
+    display_cols = ['Player', 'Status', 'My %', 'Above %', 'Below %', 'Net lev',
+                    'My − Below', 'Field %', 'FPTS rank']
+    styled = (
+        active[display_cols].style
+        .format({
+            'My %': '{:.1f}',
+            'Above %': '{:.1f}',
+            'Below %': '{:.1f}',
+            'Net lev': '{:+.1f}',
+            'My − Below': '{:+.1f}',
+            'Field %': '{:.1f}',
         })
-        st.dataframe(styled_above, use_container_width=True, height=400)
-    else:
-        st.success("Nobody is above your best lineup.")
+        .map(style_lev, subset=['Net lev'])
+        .map(style_status, subset=['Status'])
+    )
+    st.dataframe(styled, use_container_width=True, height=min(500, 60 + 35 * len(active)))
 
-with col_below:
-    st.markdown(f"### Below me ({len(below)})")
-    st.caption("Entries scoring below your best. Lower overlap + more holes = real threat to pass you.")
-    if below:
-        rows = []
-        for r in below:
-            rows.append({
-                'Rank': r['Rank'],
-                'Handle': r['Handle'][:18],
-                'Points': r['Points'],
-                'Gap': r['Points'] - summary['best_score'],
-                'Overlap': f"{r['Overlap']}/6",
-                'Holes left': r['Holes'] if r['Holes'] is not None else '—',
-            })
-        bdf = pd.DataFrame(rows)
-        styled_below = bdf.style.format({
-            'Points': '{:.1f}', 'Gap': '{:.1f}',
-        })
-        st.dataframe(styled_below, use_container_width=True, height=400)
-    else:
-        st.info("No threats currently below you in range.")
+    if len(cut):
+        with st.expander(f"Cut players ({len(cut)}) — leverage no longer matters"):
+            st.dataframe(
+                cut[display_cols].style.format({
+                    'My %': '{:.1f}', 'Above %': '{:.1f}', 'Below %': '{:.1f}',
+                    'Net lev': '{:+.1f}', 'My − Below': '{:+.1f}', 'Field %': '{:.1f}',
+                }),
+                use_container_width=True,
+            )
+
+    csv = active[display_cols].to_csv(index=False).encode('utf-8')
+    st.download_button("⬇ Download CSV", csv, f"{my_handle}_local_leverage.csv", "text/csv")
 
 # ---- Footer ----
 st.markdown("---")
@@ -652,3 +797,4 @@ st.caption(
     "round boundaries (between R3 and R4) — mid-round inference is noisier. "
     "Re-upload a fresh standings file to refresh."
 )
+
