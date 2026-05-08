@@ -41,17 +41,29 @@ DEFAULT_TIER_FPTS = {
     'remaining_field': 35,  # Made cut, no top-20 → finish bonus only
 }
 
-NAME_OVERRIDES_DG_TO_DK = {
-    # DG returns "first last" with various accent handling; DK uses preferred display name
-    'matt fitzpatrick': 'Matt Fitzpatrick',
-    'matthew mccarty': 'Matthew McCarty',
-    'nicolas echavarria': 'Nicolas Echavarria',
+NAME_ALIASES = {
+    # DG returns "Last, First" with various short-form / accent handling;
+    # this maps DG-normalized form → DK-normalized form so the lookup
+    # works either way. Add new mismatches as encountered.
+    'nicoechavarria': 'nicolasechavarria',
+    'mattmccarty': 'matthewmccarty',
 }
 
 
 def norm_name(s):
     """Normalize: lowercase, strip non-alpha. Used for cross-source matching."""
     return re.sub(r'[^a-z]', '', str(s).lower())
+
+
+def norm_dg_name(name):
+    """Normalize a DataGolf player name. DG returns 'Last, First' format
+    (e.g., 'Young, Cameron'); we flip to 'First Last' before normalizing
+    so it matches DK's standard 'First Last' format."""
+    s = str(name).strip()
+    if ',' in s:
+        last, first = s.split(',', 1)
+        s = f"{first.strip()} {last.strip()}"
+    return norm_name(s)
 
 
 @st.cache_data(ttl=300, show_spinner=False)  # 5-minute TTL matches API refresh cadence
@@ -95,13 +107,20 @@ def fetch_datagolf_inplay(api_key, tour='pga'):
         t5 = _coerce_pct(p.get('top_5'))
         t10 = _coerce_pct(p.get('top_10'))
         t20 = _coerce_pct(p.get('top_20'))
-        out[norm_name(name)] = {
+        out[norm_dg_name(name)] = {
             'display_name': name,
             'win_pct': win,
             'top_5_pct': t5,
             'top_10_pct': t10,
             'top_20_pct': t20,
         }
+
+    # Apply known name aliases — for any DG-form key that has a DK-form variant,
+    # add an alias entry so the lookup succeeds either way.
+    for dg_form, dk_form in NAME_ALIASES.items():
+        if dg_form in out and dk_form not in out:
+            out[dk_form] = out[dg_form]
+
     return out
 
 
